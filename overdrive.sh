@@ -95,21 +95,29 @@ _download(){
 	local URL=$1
 	local OUTPUT=$2
 
-    curl --retry 5 -L --silent --show-error --user-agent "$UserAgent" --output "$OUTPUT" "$URL" 
+    curl --fail --retry 5 -L --silent --show-error --user-agent "$UserAgent" --output "$OUTPUT" "$URL" 
 	return $?
+}
+
+_sanitize() {
+  # Usage: printf 'Hello, world!\n' | _sanitize
+  #
+  # Replace filename-unfriendly characters with a hyphen and trim leading/trailing hyphens/spaces
+  tr -Cs '[:alnum:] ._-' - | sed -e 's/^[- ]*//' -e 's/[- ]*$//'
 }
 
 _xmllint_iter_xpath() {
   # Usage: _xmllint_iter_xpath /xpath/to/list file.xml [/path/to/value]
   #
-  # Iterate over each XPath match, separated by newlines.
+  # Iterate over each XPath match, ensuring each ends with exactly one newline.
   count=$(xmllint --xpath "count($1)" "$2")
-  for i in $(seq 1 "$count"); do
-    if [[ $i != 1 ]]; then
-      printf '\n'
-    fi
-    xmllint --xpath "string($1[position()=$i]$3)" "$2"
-  done
+  if [[ $count -gt 0 ]]; then
+    for i in $(seq 1 "$count"); do
+      # xmllint does not reliably emit newlines, so we use command substitution to
+      # trim trailing newlines, if there are any, and printf to add exactly one.
+      printf '%s\n' "$(xmllint --xpath "string($1[position()=$i]$3)" "$2")"
+    done
+  fi
 }
 
 _get_clientid() {
@@ -138,7 +146,10 @@ acquire_license() {
   #
   # Read the license signature from book.license if it exists; if it doesn't,
   # acquire a license from the OverDrive server and write it to book.license.
-  if [[ -e $2 ]]; then
+  # We store the license in a file because OverDrive will only grant one license per `.odm` file,
+  # so that if something goes wrong later on, like your internet cuts out mid-download,
+  # it's easy to resume/recover where you left off.
+  if [[ -s $2 ]]; then
     INFO "License already acquired: $2"
   else
     # generate random Client ID
@@ -147,16 +158,23 @@ acquire_license() {
     # first extract the "AcquisitionUrl"
     AcquisitionUrl=$(xmllint --xpath '/OverDriveMedia/License/AcquisitionUrl/text()' "$1")
     INFO "Using AcquisitionUrl=$AcquisitionUrl"
-
+    # along with the only other important (for getting the license) field, "MediaID"
     MediaID=$(xmllint --xpath 'string(/OverDriveMedia/@id)' "$1")
     INFO "Using MediaID=$MediaID"
 
-    # Compute the Hash value; thanks to https://github.com/jvolkening/gloc/blob/v0.601/gloc#L1523-L1531
+    # Compute the Base64-encoded SHA-1 hash from a few `|`-separated values
+    # and a suffix of `OVERDRIVE*MEDIA*CONSOLE`, but backwards.
+    # Thanks to https://github.com/jvolkening/gloc/blob/v0.601/gloc#L1523-L1531
+    # for somehow figuring out how to construct that hash!
     RawHash="$ClientID|$OMC|$OS|ELOSNOC*AIDEM*EVIRDREVO"
     DEBUG "Using RawHash=$RawHash"
     Hash=$(echo -n "$RawHash" | iconv -f ASCII -t UTF-16LE | openssl dgst -binary -sha1 | base64)
     DEBUG "Using Hash=$Hash"
 
+    # Submit a request to the OverDrive server to get the full license for this book,
+    # which is a small XML file with a root element <License>,
+    # which contains a long Base64-encoded <Signature>,
+    # which is subsequently used to retrieve the content files.
     _download "$AcquisitionUrl?MediaID=$MediaID&ClientID=$ClientID&OMC=$OMC&OS=$OS&Hash=$Hash" "$2"
   fi
 }
@@ -237,7 +255,7 @@ download() {
   metadata_path=$1.metadata
   extract_metadata "$1" "$metadata_path"
 
-  # extract the author and title
+  # extract the author and title from the metadata
   Author=$(extract_author "$metadata_path")
   DEBUG "Using Author=$Author"
   Title=$(extract_title "$metadata_path")
@@ -337,11 +355,16 @@ early_return() {
   INFO 'Finished returning book'
 }
 
+HEADER_PRINTED=
 info() {
   # Usage: info book.odm
+  if [[ -z $HEADER_PRINTED ]]; then
+    printf '%s\t%s\t%s\n' author title duration
+    HEADER_PRINTED=1
+  fi
   metadata_path=$1.metadata
   extract_metadata "$1" "$metadata_path"
-  printf 'Author:\t%s\nTitle:\t%s\nSubtitle:\t%s\nDuration:\t%d seconds\n' "$(extract_author "$metadata_path")" "$(extract_title "$metadata_path")" "$(extract_subtitle "$metadata_path")" "$(extract_duration "$1")"
+  printf '%s\t%s\t%d\n' "$(extract_author "$metadata_path")" "$(extract_title "$metadata_path")" "$(extract_duration "$1")"
 }
 
 metadata() {
@@ -353,7 +376,7 @@ metadata() {
 
 # now actually loop over the media files and commands
 for ODM in "${MEDIA[@]}"; do
-  INFO "processing file $ODM"
+  INFO "Processing file $ODM"
   for COMMAND in "${COMMANDS[@]}"; do
     case $COMMAND in
       download)

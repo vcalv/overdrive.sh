@@ -168,6 +168,7 @@ but it actually depends on several executables being available on your `PATH`:
 * `iconv`
 * `openssl`
 * `base64`
+* `htmltidy`
 
 If you get an error like `-bash: xmllint: command not found`,
 you're evidently missing one of those;
